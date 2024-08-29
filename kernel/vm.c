@@ -5,9 +5,12 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
-
 #include "spinlock.h"
 #include "proc.h"
+
+// Just declare the variables from kernel/kalloc.c
+extern int useReference[PHYSTOP/PGSIZE];
+extern struct spinlock ref_count_lock;
 
 /*
  * the kernel's page table.
@@ -18,36 +21,45 @@ extern char etext[];  // kernel.ld sets this to end of kernel code.
 
 extern char trampoline[]; // trampoline.S
 
-/*
- * create a direct-map page table for the kernel.
- */
-void
-kvminit()
+// Make a direct-map page table for the kernel.
+pagetable_t
+kvmmake(void)
 {
-  kernel_pagetable = (pagetable_t) kalloc();
-  memset(kernel_pagetable, 0, PGSIZE);
+  pagetable_t kpgtbl;
+
+  kpgtbl = (pagetable_t) kalloc();
+  memset(kpgtbl, 0, PGSIZE);
 
   // uart registers
-  kvmmap(UART0, UART0, PGSIZE, PTE_R | PTE_W);
+  kvmmap(kpgtbl, UART0, UART0, PGSIZE, PTE_R | PTE_W);
 
   // virtio mmio disk interface
-  kvmmap(VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
-
-  // CLINT
-  kvmmap(CLINT, CLINT, 0x10000, PTE_R | PTE_W);
+  kvmmap(kpgtbl, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
 
   // PLIC
-  kvmmap(PLIC, PLIC, 0x400000, PTE_R | PTE_W);
+  kvmmap(kpgtbl, PLIC, PLIC, 0x400000, PTE_R | PTE_W);
 
   // map kernel text executable and read-only.
-  kvmmap(KERNBASE, KERNBASE, (uint64)etext-KERNBASE, PTE_R | PTE_X);
+  kvmmap(kpgtbl, KERNBASE, KERNBASE, (uint64)etext-KERNBASE, PTE_R | PTE_X);
 
   // map kernel data and the physical RAM we'll make use of.
-  kvmmap((uint64)etext, (uint64)etext, PHYSTOP-(uint64)etext, PTE_R | PTE_W);
+  kvmmap(kpgtbl, (uint64)etext, (uint64)etext, PHYSTOP-(uint64)etext, PTE_R | PTE_W);
 
   // map the trampoline for trap entry/exit to
   // the highest virtual address in the kernel.
-  kvmmap(TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+  kvmmap(kpgtbl, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+
+  // map kernel stacks
+  proc_mapstacks(kpgtbl);
+  
+  return kpgtbl;
+}
+
+// Initialize the one kernel_pagetable
+void
+kvminit(void)
+{
+  kernel_pagetable = kvmmake();
 }
 
 // Switch h/w page table register to the kernel's page table,
@@ -104,23 +116,10 @@ walkaddr(pagetable_t pagetable, uint64 va)
     return 0;
 
   pte = walk(pagetable, va, 0);
-  if (pte == 0 || (*pte & PTE_V) == 0){
-    struct proc *p = myproc();
-    if (va >= p->sz || va <= PGROUNDDOWN(p->trapframe->sp))
-      return 0;
-
-    char *pa = kalloc();
-    if (pa == 0)
-      return 0;
-    else {
-      memset(pa, 0, PGSIZE);
-      if (mappages(p->pagetable, PGROUNDDOWN(va), PGSIZE, (uint64)pa, PTE_W | PTE_R | PTE_U) != 0){
-        kfree(pa);
-        return 0;
-      }
-    }
-  }
-
+  if(pte == 0)
+    return 0;
+  if((*pte & PTE_V) == 0)
+    return 0;
   if((*pte & PTE_U) == 0)
     return 0;
   pa = PTE2PA(*pte);
@@ -131,30 +130,10 @@ walkaddr(pagetable_t pagetable, uint64 va)
 // only used when booting.
 // does not flush TLB or enable paging.
 void
-kvmmap(uint64 va, uint64 pa, uint64 sz, int perm)
+kvmmap(pagetable_t kpgtbl, uint64 va, uint64 pa, uint64 sz, int perm)
 {
-  if(mappages(kernel_pagetable, va, sz, pa, perm) != 0)
+  if(mappages(kpgtbl, va, sz, pa, perm) != 0)
     panic("kvmmap");
-}
-
-// translate a kernel virtual address to
-// a physical address. only needed for
-// addresses on the stack.
-// assumes va is page aligned.
-uint64
-kvmpa(uint64 va)
-{
-  uint64 off = va % PGSIZE;
-  pte_t *pte;
-  uint64 pa;
-  
-  pte = walk(kernel_pagetable, va, 0);
-  if(pte == 0)
-    panic("kvmpa");
-  if((*pte & PTE_V) == 0)
-    panic("kvmpa");
-  pa = PTE2PA(*pte);
-  return pa+off;
 }
 
 // Create PTEs for virtual addresses starting at va that refer to
@@ -167,13 +146,16 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
   uint64 a, last;
   pte_t *pte;
 
+  if(size == 0)
+    panic("mappages: size");
+  
   a = PGROUNDDOWN(va);
   last = PGROUNDDOWN(va + size - 1);
   for(;;){
     if((pte = walk(pagetable, a, 1)) == 0)
       return -1;
     if(*pte & PTE_V)
-      panic("remap");
+      panic("mappages: remap");
     *pte = PA2PTE(pa) | perm | PTE_V;
     if(a == last)
       break;
@@ -197,11 +179,9 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
 
   for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
     if((pte = walk(pagetable, a, 0)) == 0)
-      // panic("uvmunmap: walk");
-      continue;
+      panic("uvmunmap: walk");
     if((*pte & PTE_V) == 0)
-      // panic("uvmunmap: not mapped");
-      continue;
+      panic("uvmunmap: not mapped");
     if(PTE_FLAGS(*pte) == PTE_V)
       panic("uvmunmap: not a leaf");
     if(do_free){
@@ -329,22 +309,38 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
+  //char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
-      // panic("uvmcopy: pte should exist");
-      continue;
+      panic("uvmcopy: pte should exist");
     if((*pte & PTE_V) == 0)
-      // panic("uvmcopy: page not present");
-      continue;
+      panic("uvmcopy: page not present");
+    
+    // 父进程内存页可写,子进程和父进程都设置为COW和只读；
+    // 否则，都是只读的，不标记为COW，不会进行写入
+    // 若父进程内存只读的时候，标记为COW后经过缺页中断，程序就可以写入数据
+    if (*pte & PTE_W) {
+      // set PTE_W to 0
+      *pte &= ~PTE_W;
+      // set PTE_RSW to 1
+      // set COW page
+      *pte |= PTE_RSW;
+    }
+    
     pa = PTE2PA(*pte);
+
+    // increment the ref count
+    acquire(&ref_count_lock);
+    useReference[pa/PGSIZE] += 1;
+    release(&ref_count_lock);
+
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+    // if((mem = kalloc()) == 0)
+    //   goto err;
+    // memmove(mem, (char*)pa, PGSIZE);
+    if(mappages(new, i, PGSIZE, (uint64)pa, flags) != 0){
+      // kfree(mem);
       goto err;
     }
   }
@@ -368,6 +364,13 @@ uvmclear(pagetable_t pagetable, uint64 va)
   *pte &= ~PTE_U;
 }
 
+// 检查一个页面是否是 COW 页面
+int checkcowpage(uint64 va, pte_t *pte, struct proc* p) {
+  return (va < p->sz) // va should blow the size of process memory (bytes)
+    && (*pte & PTE_V) // Ensure that the incoming pte is valid
+    && (*pte & PTE_RSW); // pte is COW page
+}
+
 // Copy from kernel to user.
 // Copy len bytes from src to virtual address dstva in a given page table.
 // Return 0 on success, -1 on error.
@@ -381,6 +384,36 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0)
       return -1;
+
+    // added start
+    struct proc *p = myproc();
+    pte_t *pte = walk(pagetable, va0, 0);
+    if (*pte == 0)
+      p->killed = 1;
+    // Check if the current page satisfies the conditions of the COW page
+    if (checkcowpage(va0, pte, p)) 
+    {
+      char *mem;
+      if ((mem = kalloc()) == 0) {
+        // kill the process
+        p->killed = 1;
+      }else {
+        // Copies the contents of the original page into the new page.
+        memmove(mem, (char*)pa0, PGSIZE);
+        // This statement must be above the next statement
+        uint flags = PTE_FLAGS(*pte);
+        // decrease the reference count of old memory that va0 point and set pte to 0
+        uvmunmap(pagetable, va0, 1, 1);
+        // change the physical memory address and set PTE_W to 1
+        *pte = (PA2PTE(mem) | flags | PTE_W);
+        // set PTE_RSW to 0
+        *pte &= ~PTE_RSW;
+        // update pa0 to new physical memory address
+        pa0 = (uint64)mem;
+      }
+    }
+    // added end
+
     n = PGSIZE - (dstva - va0);
     if(n > len)
       n = len;
